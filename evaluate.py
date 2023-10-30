@@ -13,13 +13,41 @@ import matplotlib.pyplot as plt
 from time import time
 
 from torch.multiprocessing import Process
+from torchvision.utils import save_image
 from torch.cuda.amp import autocast
 
 from model import AutoEncoder
 import utils
 import datasets
+from tqdm import tqdm
 from train import test, init_processes, test_vae_fid
 
+@torch.no_grad()
+def save_img_batch(img_batch, batch_size,
+                   batch_id, num_images, saved_imgs,
+                   base_dir,imgs_per_folder=1000):       
+    
+    for idx, img in enumerate(img_batch.detach()):
+        global_index = batch_size * batch_id + idx
+        
+        # if global_index<imgs_per_folder:
+        #     save_path = os.path.join(base_dir, f'{0:07d}')
+        # else:
+        save_path = os.path.join(base_dir, f'{global_index-global_index%1000:07d}')
+        os.makedirs(save_path,exist_ok=True)
+        
+        if global_index < num_images:
+            img_path = os.path.join(save_path, f'{global_index:07d}.png')
+            if saved_imgs<imgs_per_folder:
+                save_image(img.clamp(0.0, 1.0), img_path)
+                saved_imgs+=1
+            else:
+                #save_path = os.path.join(base_dir, f'{global_index-global_index%1000:07d}')
+                #os.makedirs(save_path,exist_ok=True)
+                img_path = os.path.join(save_path,  f'{global_index:07d}.png')
+                save_image(img.clamp(0.0, 1.0), img_path)
+                saved_imgs=1
+    return saved_imgs
 
 def set_bn(model, bn_eval_mode, num_samples=1, t=1.0, iter=100):
     if bn_eval_mode:
@@ -28,7 +56,7 @@ def set_bn(model, bn_eval_mode, num_samples=1, t=1.0, iter=100):
         model.train()
         with autocast():
             for i in range(iter):
-                if i % 10 == 0:
+                if i % 50 == 0:
                     print('setting BN statistics iter %d out of %d' % (i+1, iter))
                 model.sample(num_samples, t)
         model.eval()
@@ -67,7 +95,7 @@ def main(eval_args):
     # did not have this variable.
     model.load_state_dict(checkpoint['state_dict'], strict=False)
     model = model.cuda()
-
+    
     logging.info('args = %s', args)
     logging.info('num conv layers: %d', len(model.all_conv_layers))
     logging.info('param size = %fM ', utils.count_parameters_in_M(model))
@@ -98,38 +126,29 @@ def main(eval_args):
         fid = test_vae_fid(model, args, total_fid_samples=50000)
         logging.info('fid is %f' % fid)
     else:
+        # GENERATE IMAGES
+        print("Generating images...")
         bn_eval_mode = not eval_args.readjust_bn
-        total_samples = 50000 // eval_args.world_size          # num images per gpu
-        num_samples = 100                                      # sampling batch size
-        num_iter = int(np.ceil(total_samples / num_samples))   # num iterations per gpu
-
+        total_samples = eval_args.num_iw_samples    
+        samples_per_batch= 100                                      # sampling batch size
+        num_iter = int(np.ceil(total_samples // samples_per_batch))   # num iterations per gpu
+        saved_imgs = 0
+        
         with torch.no_grad():
-            n = int(np.floor(np.sqrt(num_samples)))
             set_bn(model, bn_eval_mode, num_samples=16, t=eval_args.temp, iter=500)
-            for ind in range(num_iter):     # sampling is repeated.
+            for batch_id in tqdm(range(num_iter)):     # sampling is repeated.
                 torch.cuda.synchronize()
-                start = time()
                 with autocast():
-                    logits = model.sample(num_samples, eval_args.temp)
+                    logits = model.sample(samples_per_batch, eval_args.temp)
                 output = model.decoder_output(logits)
                 output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) \
                     else output.sample()
+                output_img = output_img.cpu().clamp(0.0, 1.0)
                 torch.cuda.synchronize()
-                end = time()
-                logging.info('sampling time per batch: %0.3f sec', (end - start))
-
-                visualize = False
-                if visualize:
-                    output_tiled = utils.tile_image(output_img, n).cpu().numpy().transpose(1, 2, 0)
-                    output_tiled = np.asarray(output_tiled * 255, dtype=np.uint8)
-                    output_tiled = np.squeeze(output_tiled)
-
-                    plt.imshow(output_tiled)
-                    plt.show()
-                else:
-                    file_path = os.path.join(eval_args.save, 'gpu_%d_samples_%d.npz' % (eval_args.local_rank, ind))
-                    np.savez_compressed(file_path, samples=output_img.cpu().numpy())
-                    logging.info('Saved at: {}'.format(file_path))
+                
+                saved_imgs = save_img_batch(output_img, samples_per_batch,
+                    batch_id, eval_args.num_iw_samples,saved_imgs,
+                    base_dir=eval_args.save)
 
 
 if __name__ == '__main__':
